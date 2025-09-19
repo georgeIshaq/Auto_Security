@@ -1,0 +1,52 @@
+{
+  "app": {
+    "name": "Vulnerable App Demo",
+    "version": "1.0.0",
+    "environment": "development"
+  },
+  "server": {
+    "port": 3000,
+    "host": "localhost"
+  },
+  "database": {
+    "mysql": {
+      "host": "localhost",
+      "port": 3306,
+      "username": "root",
+      "password": "rootpassword123",
+      "database": "dev_app"
+    }
+  },
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "password": "dev_redis_password",
+    "db": 0
+  },
+  "jwt": {
+    "secret": "dev-jwt-secret-key",
+    "expiresIn": "24h"
+  },
+  "encryption": {
+    "algorithm": "aes-256-cbc",
+    "key": "dev-encryption-key-32-characters"
+  },
+  "logging": {
+    "level": "debug",
+    "file": "./logs/development.log"
+  },
+  "apis": {
+    "stripe": {
+      "public_key": "pk_test_51234567890abcdef1234567890abcdef1234567890abcdef",
+      "secret_key": "sk_test_51234567890abcdef1234567890abcdef1234567890abcdef"
+    },
+    "github": {
+      "token": "ghp_1234567890abcdef1234567890abcdef12345678"
+    }
+  },
+  "admin": {
+    "username": "admin",
+    "password": "admin123",
+    "email": "admin@dev.com"
+  }
+}
