@@ -13,6 +13,8 @@ Requirements:
 """
 
 import os
+import json
+import re
 import logging
 from typing import Optional, Dict, Any, List
 from github import Github, GithubException
@@ -60,6 +62,106 @@ class GitHubIntegration:
         except GithubException as e:
             logger.error(f"Failed to get repository {repo_name}: {e}")
             raise
+    
+    def get_file_content(self, repo_name: str, file_path: str) -> Optional[str]:
+        """
+        Get decoded content of a specific file from repository.
+        
+        Args:
+            repo_name: Repository name in format 'owner/repo'
+            file_path: Path to the file in the repository
+            
+        Returns:
+            File content as string, or None if file not found
+        """
+        try:
+            repo = self.get_repository(repo_name)
+            file_content = repo.get_contents(file_path)
+            return file_content.decoded_content.decode('utf-8')
+        except GithubException:
+            return None
+    
+    def extract_packages_from_repo(self, repo_name: str) -> List[str]:
+        """
+        Extract package names from common dependency files in repository.
+        
+        Args:
+            repo_name: Repository name in format 'owner/repo'
+            
+        Returns:
+            List of package names found in the repository
+        """
+        packages = []
+        dependency_files = {
+            'package.json': self._extract_npm_packages,
+            'requirements.txt': self._extract_pip_packages,
+            'pom.xml': self._extract_maven_packages,
+            'Gemfile': self._extract_gem_packages,
+            'go.mod': self._extract_go_packages
+        }
+        
+        for file_path, extractor in dependency_files.items():
+            content = self.get_file_content(repo_name, file_path)
+            if content:
+                packages.extend(extractor(content))
+        
+        return list(set(packages))  # Remove duplicates
+    
+    def _extract_npm_packages(self, content: str) -> List[str]:
+        """Extract package names from package.json"""
+        try:
+            data = json.loads(content)
+            packages = []
+            for dep_type in ['dependencies', 'devDependencies']:
+                if dep_type in data:
+                    packages.extend(data[dep_type].keys())
+            return packages
+        except json.JSONDecodeError:
+            return []
+    
+    def _extract_pip_packages(self, content: str) -> List[str]:
+        """Extract package names from requirements.txt"""
+        packages = []
+        for line in content.strip().split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#'):
+                # Remove version specifiers
+                package = re.split(r'[>=<!\s]', line)[0].strip()
+                if package:
+                    packages.append(package)
+        return packages
+    
+    def _extract_maven_packages(self, content: str) -> List[str]:
+        """Extract artifact IDs from pom.xml"""
+        packages = []
+        artifact_pattern = r'<artifactId>([^<]+)</artifactId>'
+        matches = re.findall(artifact_pattern, content)
+        return matches
+    
+    def _extract_gem_packages(self, content: str) -> List[str]:
+        """Extract gem names from Gemfile"""
+        packages = []
+        gem_pattern = r'gem\s+[\'"]([^\'"]+)[\'"]'
+        matches = re.findall(gem_pattern, content)
+        return matches
+    
+    def _extract_go_packages(self, content: str) -> List[str]:
+        """Extract module names from go.mod"""
+        packages = []
+        require_section = False
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('require'):
+                require_section = True
+                continue
+            if require_section and line.startswith(')'):
+                break
+            if require_section and line:
+                # Extract module name (first part before version)
+                parts = line.split()
+                if parts and not parts[0].startswith('//'):
+                    packages.append(parts[0])
+        return packages
     
     # Pull Request Functions
     

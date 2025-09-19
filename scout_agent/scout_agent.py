@@ -21,6 +21,10 @@ from dotenv import load_dotenv
 # Import our MCP client
 from .mcp_stdio_client import BrightDataMCPStdioClient
 
+# Add parent directory to path for GitHub client import
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from llama_index.core import Document, Settings, StorageContext
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -431,9 +435,13 @@ class ScoutAgent:
             logger.error(f"Failed to get CVE context: {e}")
             return []
 
-    def scrape_real_vulnerabilities_via_mcp(self, limit: int = 10) -> List[VulnerabilityData]:
+    def scrape_real_vulnerabilities_via_mcp(self, limit: int = 10, packages: List[str] = None) -> List[VulnerabilityData]:
         """
         Scrape real vulnerability data using BrightData MCP
+        
+        Args:
+            limit: Maximum number of vulnerabilities to return
+            packages: List of package names to search for specifically
         """
         if not self.mcp_client:
             logger.warning("MCP client not available, falling back to mock data")
@@ -443,43 +451,56 @@ class ScoutAgent:
             logger.info(f"Fetching real vulnerability data via MCP (limit: {limit})")
             vulnerabilities = []
             
-            # Search for specific CVE detail pages
-            search_response = self.mcp_client.search_engine(
-                '"CVE-2024" vulnerability details site:nvd.nist.gov', 
-                max_results=limit * 3  # Get more results to find specific CVE pages
-            )
+            # Create search queries - either package-specific or general
+            search_queries = []
+            if packages:
+                # Search for vulnerabilities specific to the packages (limit to 5 max)
+                top_packages = packages[:5]
+                for package in top_packages:
+                    search_queries.append(f'"{package}" vulnerability CVE site:nvd.nist.gov')
+                logger.info(f"Using package-specific searches for: {top_packages}")
+            else:
+                # Fallback to general search
+                search_queries = ['"CVE-2024" vulnerability details site:nvd.nist.gov']
+                logger.info("Using general CVE search")
             
-            if not search_response.success:
-                logger.error(f"MCP search failed: {search_response.error}")
-                return self.scrape_nvd_cves(limit)
+            all_urls = []
+            for query in search_queries:
+                search_response = self.mcp_client.search_engine(
+                    query, 
+                    max_results=3  # Limit to 3 results per package to keep it fast
+                )
+                
+                if not search_response.success:
+                    logger.warning(f"MCP search failed for query '{query}': {search_response.error}")
+                    continue
+                
+                # Process search results and extract CVE information
+                search_results = search_response.data.get('content', [])
+                
+                if search_results:
+                    # BrightData returns search results as markdown text, not structured URLs
+                    search_content = search_results[0].get('text', '') if search_results else ''
+                    
+                    # Extract specific CVE detail URLs from the markdown search results
+                    import re
+                    # Look for specific CVE detail page URLs
+                    cve_detail_patterns = [
+                        r'https://nvd\.nist\.gov/vuln/detail/CVE-[0-9]{4}-[0-9]+',
+                        r'https://cve\.mitre\.org/cgi-bin/cvename\.cgi\?name=CVE-[0-9]{4}-[0-9]+',
+                    ]
+                    
+                    for pattern in cve_detail_patterns:
+                        found_urls = re.findall(pattern, search_content)
+                        all_urls.extend(found_urls)
             
-            # Process search results and extract CVE information
-            search_results = search_response.data.get('content', [])
+            # Remove duplicates while preserving order
+            all_urls = list(dict.fromkeys(all_urls))
             
-            if search_results:
-                # BrightData returns search results as markdown text, not structured URLs
-                search_content = search_results[0].get('text', '') if search_results else ''
-                
-                # Extract specific CVE detail URLs from the markdown search results
-                import re
-                # Look for specific CVE detail page URLs
-                cve_detail_patterns = [
-                    r'https://nvd\.nist\.gov/vuln/detail/CVE-[0-9]{4}-[0-9]+',
-                    r'https://cve\.mitre\.org/cgi-bin/cvename\.cgi\?name=CVE-[0-9]{4}-[0-9]+',
-                ]
-                
-                urls = []
-                for pattern in cve_detail_patterns:
-                    found_urls = re.findall(pattern, search_content)
-                    urls.extend(found_urls)
-                
-                # Remove duplicates while preserving order
-                urls = list(dict.fromkeys(urls))
-                
-                logger.info(f"Extracted {len(urls)} CVE-related URLs from search results")
-                
-                # Scrape each relevant CVE URL
-                for url in urls[:limit]:
+            logger.info(f"Extracted {len(all_urls)} CVE-related URLs from search results")
+            
+            # Scrape each relevant CVE URL
+            for url in all_urls[:limit]:
                     try:
                         logger.info(f"Scraping CVE URL: {url}")
                         page_response = self.mcp_client.scrape_as_markdown(url)
@@ -519,6 +540,50 @@ class ScoutAgent:
         except Exception as e:
             logger.error(f"Failed to fetch real vulnerabilities via MCP: {e}")
             return self.scrape_nvd_cves(limit)
+
+    def scan_repository_for_vulnerabilities(self, repo_name: str, github_token: Optional[str] = None) -> List[VulnerabilityData]:
+        """
+        Scan a GitHub repository for vulnerabilities based on its dependencies.
+        
+        Args:
+            repo_name: Repository name in format 'owner/repo'
+            github_token: GitHub API token (optional, will use env var if not provided)
+            
+        Returns:
+            List of vulnerabilities relevant to the repository's packages
+        """
+        try:
+            # Import GitHub client here to avoid circular imports
+            from github_client.github_integration import GitHubIntegration
+            
+            logger.info(f"Starting repository-aware vulnerability scan for: {repo_name}")
+            
+            # Initialize GitHub client
+            gh_client = GitHubIntegration(github_token)
+            
+            # Extract packages from repository
+            packages = gh_client.extract_packages_from_repo(repo_name)
+            logger.info(f"Found {len(packages)} packages in repository: {packages}")
+            
+            if not packages:
+                logger.warning("No packages found, falling back to general vulnerability scan")
+                return self.scrape_real_vulnerabilities_via_mcp(limit=10)
+            
+            # Search for vulnerabilities specific to these packages
+            vulnerabilities = self.scrape_real_vulnerabilities_via_mcp(
+                limit=15,  # Get more results since we have specific packages
+                packages=packages
+            )
+            
+            logger.info(f"Found {len(vulnerabilities)} vulnerabilities for repository packages")
+            return vulnerabilities
+            
+        except ImportError as e:
+            logger.error(f"Failed to import GitHub client: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Failed to scan repository {repo_name}: {e}")
+            return []
 
     def _parse_vulnerability_from_content(self, content: str, url: str, title: str, description: str) -> Optional[VulnerabilityData]:
         """
