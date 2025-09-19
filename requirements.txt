@@ -21,6 +21,10 @@ fastapi==0.116.2
 uvicorn==0.35.0
 pygithub==2.8.1
 
+# Flask backend dependencies
+flask==3.1.0
+flask-cors==5.0.0
+
 # Development dependencies
 pytest==8.4.2
 black==25.9.0
