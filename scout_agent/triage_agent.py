@@ -80,31 +80,40 @@ class TriageAgent:
     def _generate_patch(self, finding: Finding) -> Optional[str]:
         """
         Generates a patch for a given finding.
-        Uses a rule-based approach for simple, high-confidence fixes.
-        Uses an AI-powered approach for more complex vulnerabilities.
+        Attempts a rule-based approach first for high-confidence fixes,
+        then falls back to an AI-powered approach for more complex cases.
         """
-        # --- Rule-Based Remediation for High-Confidence Fixes ---
-        if finding.type == 'HARDCODED_SECRETS':
-            logger.info(f"Using rule-based remediation for {finding.type}")
-            # Simple rule: replace hardcoded secret with an environment variable placeholder
-            language = Path(finding.file_path).suffix.lower()
-            if language in ['.py', '.js', '.jsx', '.ts', '.tsx']:
-                # Extract a variable name from the evidence to create a sensible placeholder
-                match = re.search(r"(\w+)\s*[:=]", finding.evidence)
-                variable_name = "YOUR_SECRET_VARIABLE" # Default
-                if match:
-                    raw_name = match.group(1)
-                    variable_name = re.sub(r'^(const|let|var)\s+', '', raw_name).strip().upper()
-                
-                # Return the placeholder format based on language
-                if language == '.py':
-                    return f"os.getenv('{variable_name}')"
-                else: # JavaScript/TypeScript
-                    return f"process.env.{variable_name}"
-            return None # Fallback for other languages
+        use_ai_fallback = False
 
-        # --- AI-Powered Remediation for Other Vulnerabilities ---
-        else:
+        # --- Rule-Based Remediation Attempt for High-Confidence Fixes ---
+        if finding.type == 'HARDCODED_SECRETS':
+            logger.info(f"Attempting rule-based remediation for {finding.type}")
+            
+            # First, validate if the rule is even applicable to the evidence.
+            # The rule expects a quoted string to replace.
+            if not re.search(r"['\"].*?['\"]", finding.evidence):
+                logger.warning(f"Rule-based remediation is not applicable for evidence: '{finding.evidence}'. Falling back to AI.")
+                use_ai_fallback = True
+            else:
+                # If applicable, try to generate the patch
+                language = Path(finding.file_path).suffix.lower()
+                if language in ['.py', '.js', '.jsx', '.ts', '.tsx']:
+                    match = re.search(r"(\w+)\s*[:=]", finding.evidence)
+                    variable_name = "YOUR_SECRET_VARIABLE"
+                    if match:
+                        raw_name = match.group(1)
+                        variable_name = re.sub(r'^(const|let|var)\s+', '', raw_name).strip().upper()
+                    
+                    if language == '.py':
+                        return f"os.getenv('{variable_name}')"
+                    else:
+                        return f"process.env.{variable_name}"
+                else:
+                    # Language not supported by rule, fall back to AI
+                    use_ai_fallback = True
+        
+        # --- AI-Powered Remediation for Other Vulnerabilities OR as a Fallback ---
+        if use_ai_fallback or finding.type != 'HARDCODED_SECRETS':
             logger.info(f"Using AI-powered remediation for {finding.type}")
             try:
                 # 1. Read the full source code of the vulnerable file
