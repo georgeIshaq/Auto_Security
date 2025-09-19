@@ -32,6 +32,8 @@ def main():
         # Update this with your repository
         repo_name = "georgeIshaq/Auto_Security"
         print(f"📁 Working with repository: {repo_name}")
+
+        """
         
         # Example 1: Create a pull request
         print("\n🔀 Creating a pull request...")
@@ -53,6 +55,8 @@ def main():
             comment="This is an automated comment from the GitHub integration script. Great work! 🚀"
         )
         print("✅ Added comment to PR")
+
+        """
         
         # Example 3: Create an issue
         print("\n🐛 Creating an issue...")
