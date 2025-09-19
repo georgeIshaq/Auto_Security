@@ -142,6 +142,11 @@ class TriageAgent:
                 response = self.llm.complete(prompt)
                 patch_content = response.text.strip()
                 
+                # 4. Clean the patch: Remove markdown formatting from the AI's response
+                markdown_match = re.search(r"```(?:\w+\n)?([\s\S]+?)```", patch_content)
+                if markdown_match:
+                    patch_content = markdown_match.group(1).strip()
+
                 # Basic validation: ensure the patch is not empty and is code-like
                 if patch_content and ('=' in patch_content or '(' in patch_content or '=>' in patch_content):
                     logger.info(f"AI generated patch for {finding.type}: {patch_content}")
@@ -155,28 +160,56 @@ class TriageAgent:
                 return None
 
     def _apply_patch(self, finding: Finding, patch_content: str) -> bool:
-        full_path = os.path.join(self.target_directory, finding.file_path)
-        backup_path = full_path + ".bak"
+        """
+        Applies a patch to a file.
+        For secrets, it replaces just the secret value.
+        For AI-generated patches, it replaces the entire line.
+        """
+        full_file_path = os.path.join(self.target_directory, finding.file_path)
         try:
-            shutil.copy2(full_path, backup_path)
-            with open(full_path, 'r') as f:
+            # Create a backup of the original file
+            backup_path = f"{full_file_path}.bak"
+            shutil.copy(full_file_path, backup_path)
+
+            with open(full_file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
-            
+
             line_index = finding.line_number - 1
-            original_line = lines[line_index]
-            
-            secret_match = re.search(r"['\"].*?['\"]", original_line)
-            if not secret_match: 
-                logger.error(f"Could not find a secret string to replace in line: {original_line.strip()}")
+            if line_index >= len(lines):
+                logger.error(f"Line number {finding.line_number} is out of bounds for file {finding.file_path}")
                 return False
             
-            new_line = original_line.replace(secret_match.group(0), patch_content)
-            lines[line_index] = new_line
-            
-            with open(full_path, 'w') as f:
+            original_line = lines[line_index]
+
+            # Use specific logic for rule-based secret replacement
+            if finding.type == 'HARDCODED_SECRETS':
+                secret_match = re.search(r"['\"].*?['\"]", original_line)
+                if not secret_match: 
+                    logger.error(f"Rule-based fix failed: Could not find a secret string to replace in line: {original_line.strip()}")
+                    return False
+                
+                # Preserve indentation
+                indentation = len(original_line) - len(original_line.lstrip(' '))
+                new_line = original_line.replace(secret_match.group(0), patch_content)
+                lines[line_index] = ' ' * indentation + new_line.lstrip(' ') + '\n'
+            else:
+                # For AI-generated patches, replace the entire line but preserve indentation
+                indentation = len(original_line) - len(original_line.lstrip(' '))
+                lines[line_index] = ' ' * indentation + patch_content.strip() + '\n'
+
+            with open(full_file_path, 'w', encoding='utf-8') as f:
                 f.writelines(lines)
+            
+            # Clean up the backup file on success
+            os.remove(backup_path)
             return True
+
+        except FileNotFoundError:
+            logger.error(f"Could not find file to patch: {full_file_path}")
+            return False
         except Exception as e:
             logger.error(f"Failed to apply patch: {e}")
-            shutil.move(backup_path, full_path)
+            # Restore from backup in case of error
+            if os.path.exists(backup_path):
+                shutil.move(backup_path, full_file_path)
             return False
