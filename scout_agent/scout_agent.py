@@ -18,6 +18,9 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+# Import our MCP client
+from .mcp_stdio_client import BrightDataMCPStdioClient
+
 from llama_index.core import Document, Settings, StorageContext
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -190,7 +193,24 @@ class ScoutAgent:
             self.exploits_index = VectorStoreIndex([], storage_context=self.exploits_storage_context)
             self.patterns_index = VectorStoreIndex([], storage_context=self.patterns_storage_context)
         
+        # Initialize MCP client for real web data fetching
+        self.mcp_client = None
+        self._init_mcp_client()
+        
         logger.info("Scout Agent initialized with Redis vector stores")
+
+    def _init_mcp_client(self):
+        """Initialize BrightData MCP client for real data fetching"""
+        try:
+            self.mcp_client = BrightDataMCPStdioClient()
+            if self.mcp_client.start():
+                logger.info("✅ BrightData MCP client initialized successfully")
+            else:
+                logger.warning("❌ Failed to start BrightData MCP client - falling back to mock data")
+                self.mcp_client = None
+        except Exception as e:
+            logger.warning(f"❌ MCP client initialization failed: {e} - falling back to mock data")
+            self.mcp_client = None
 
     def _prepare_metadata(self, data_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -411,16 +431,203 @@ class ScoutAgent:
             logger.error(f"Failed to get CVE context: {e}")
             return []
 
+    def scrape_real_vulnerabilities_via_mcp(self, limit: int = 10) -> List[VulnerabilityData]:
+        """
+        Scrape real vulnerability data using BrightData MCP
+        """
+        if not self.mcp_client:
+            logger.warning("MCP client not available, falling back to mock data")
+            return self.scrape_nvd_cves(limit)
+        
+        try:
+            logger.info(f"Fetching real vulnerability data via MCP (limit: {limit})")
+            vulnerabilities = []
+            
+            # Search for specific CVE detail pages
+            search_response = self.mcp_client.search_engine(
+                '"CVE-2024" vulnerability details site:nvd.nist.gov', 
+                max_results=limit * 3  # Get more results to find specific CVE pages
+            )
+            
+            if not search_response.success:
+                logger.error(f"MCP search failed: {search_response.error}")
+                return self.scrape_nvd_cves(limit)
+            
+            # Process search results and extract CVE information
+            search_results = search_response.data.get('content', [])
+            
+            if search_results:
+                # BrightData returns search results as markdown text, not structured URLs
+                search_content = search_results[0].get('text', '') if search_results else ''
+                
+                # Extract specific CVE detail URLs from the markdown search results
+                import re
+                # Look for specific CVE detail page URLs
+                cve_detail_patterns = [
+                    r'https://nvd\.nist\.gov/vuln/detail/CVE-[0-9]{4}-[0-9]+',
+                    r'https://cve\.mitre\.org/cgi-bin/cvename\.cgi\?name=CVE-[0-9]{4}-[0-9]+',
+                ]
+                
+                urls = []
+                for pattern in cve_detail_patterns:
+                    found_urls = re.findall(pattern, search_content)
+                    urls.extend(found_urls)
+                
+                # Remove duplicates while preserving order
+                urls = list(dict.fromkeys(urls))
+                
+                logger.info(f"Extracted {len(urls)} CVE-related URLs from search results")
+                
+                # Scrape each relevant CVE URL
+                for url in urls[:limit]:
+                    try:
+                        logger.info(f"Scraping CVE URL: {url}")
+                        page_response = self.mcp_client.scrape_as_markdown(url)
+                        logger.info(f"🌐 MCP scrape success: {page_response.success}")
+                        logger.info(f"🌐 MCP response data type: {type(page_response.data)}")
+                        logger.info(f"🌐 MCP response data: {page_response.data}")
+                        
+                        if page_response.success:
+                            # Parse the scraped content to extract CVE data
+                            content = page_response.data.get('content', [{}])
+                            logger.info(f"🌐 Extracted content type: {type(content)}")
+                            logger.info(f"🌐 Extracted content: {content}")
+                            page_text = content[0].get('text', '') if content else ''
+                            
+                            vuln_data = self._parse_vulnerability_from_content(
+                                page_text,
+                                url,
+                                f"Vulnerability from {url}",
+                                f"Security advisory found at {url}"
+                            )
+                            if vuln_data:
+                                vulnerabilities.append(vuln_data)
+                                logger.info(f"Successfully parsed vulnerability: {vuln_data.cve_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to scrape URL {url}: {e}")
+                        continue
+            
+            logger.info(f"Successfully fetched {len(vulnerabilities)} real vulnerabilities via MCP")
+            
+            # If we didn't get enough real data, supplement with mock data
+            if len(vulnerabilities) < limit:
+                mock_cves = self.scrape_nvd_cves(limit - len(vulnerabilities))
+                vulnerabilities.extend(mock_cves)
+            
+            return vulnerabilities[:limit]
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch real vulnerabilities via MCP: {e}")
+            return self.scrape_nvd_cves(limit)
+
+    def _parse_vulnerability_from_content(self, content: str, url: str, title: str, description: str) -> Optional[VulnerabilityData]:
+        """
+        Parse vulnerability data from scraped web content using LLM
+        """
+        logger.info(f"📝 Parsing content from: {url}")
+        logger.info(f"📄 Content length: {len(content)} characters")
+        logger.info(f"📋 Content preview (first 500 chars): {content[:500]}")
+        logger.info(f"🏷️  Title: {title}")
+        logger.info(f"📝 Description: {description}")
+        
+        try:
+            # Use OpenAI to extract structured CVE data from the content
+            from llama_index.llms.openai import OpenAI
+            llm = OpenAI(model="gpt-4", temperature=0.1)
+            
+            # Send full content - the CVE details are often later in the page
+            content_for_llm = content
+            
+            extraction_prompt = f"""
+            You are parsing an NIST NVD (National Vulnerability Database) page. Extract the CVE information and return it as a JSON object.
+            
+            Look for these specific patterns in the content:
+            - CVE ID: Look for "CVE-YYYY-NNNN Detail" headings
+            - Description: Look for "Description" section after the CVE detail heading  
+            - CVSS Score: Look for "Base Score:" followed by a number
+            - Severity: Look for severity ratings like "HIGH", "CRITICAL", "MEDIUM", "LOW"
+            - Vector String: Look for "Vector:" followed by CVSS vector strings
+            - Affected Software: Look for "Known Affected Software" or product names
+            - References: Look for URLs in "References to Advisories" section
+            
+            Content to parse:
+            {content_for_llm}
+            
+            Return ONLY a valid JSON object with these exact fields:
+            {{
+                "cve_id": "extracted CVE ID",
+                "description": "vulnerability description from Description section", 
+                "severity": "extracted severity level",
+                "cvss_score": extracted_numeric_score,
+                "affected_packages": ["extracted software/product names"],
+                "vulnerability_type": "type like 'use after free', 'buffer overflow', etc",
+                "published_date": "YYYY-MM-DD from NVD Published Date",
+                "vector_string": "CVSS vector string if found",
+                "references": ["reference URLs found"],
+                "exploit_available": true/false,
+                "patch_available": true/false
+            }}
+            
+            If you cannot find clear CVE data, return null.
+            """
+            
+            logger.info(f"🤖 Sending prompt to LLM (length: {len(extraction_prompt)} chars)")
+            logger.debug(f"🤖 Full prompt: {extraction_prompt}")
+            
+            response = llm.complete(extraction_prompt)
+            result_text = response.text.strip()
+            
+            logger.info(f"🤖 LLM response length: {len(result_text)} characters")
+            logger.info(f"🤖 LLM raw response: {result_text}")
+            
+            # Try to parse the JSON response
+            if result_text.lower() == "null" or not result_text:
+                logger.warning(f"❌ Empty or null response from LLM for {url}")
+                return None
+                
+            # Clean up the response to extract JSON
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0]
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].split("```")[0]
+            
+            result_text = result_text.strip()
+            
+            if not result_text:
+                logger.warning(f"No text content after cleaning for {url}")
+                return None
+            
+            vuln_dict = json.loads(result_text)
+            
+            # Create VulnerabilityData object
+            vuln_data = VulnerabilityData(
+                cve_id=vuln_dict.get("cve_id", f"SCRAPED-{int(datetime.now().timestamp())}"),
+                description=vuln_dict.get("description", description),
+                severity=vuln_dict.get("severity", "MEDIUM"),
+                cvss_score=float(vuln_dict.get("cvss_score", 5.0)),
+                affected_packages=vuln_dict.get("affected_packages", []),
+                vulnerability_type=vuln_dict.get("vulnerability_type", "unknown"),
+                published_date=vuln_dict.get("published_date", datetime.now().strftime("%Y-%m-%d")),
+                vector_string=vuln_dict.get("vector_string", ""),
+                references=vuln_dict.get("references", [url]),
+                exploit_available=vuln_dict.get("exploit_available", False),
+                patch_available=vuln_dict.get("patch_available", False)
+            )
+            
+            return vuln_data
+            
+        except Exception as e:
+            logger.warning(f"Failed to parse vulnerability from content: {e}")
+            return None
+
     def scrape_nvd_cves(self, limit: int = 10) -> List[VulnerabilityData]:
         """
-        Scrape recent CVEs from NVD (National Vulnerability Database)
-        This is a simplified version - in production you'd use official APIs
+        Fallback method with sample CVE data for when MCP is not available
         """
         try:
-            logger.info(f"Scraping recent CVEs from NVD (limit: {limit})")
+            logger.info(f"Using fallback sample CVE data (limit: {limit})")
             
-            # For demo purposes, we'll create sample CVE data
-            # In production, you'd integrate with actual CVE feeds
+            # Sample CVE data for fallback
             sample_cves = [
                 VulnerabilityData(
                     cve_id="CVE-2023-42363",
@@ -584,8 +791,8 @@ def ping():
         """
         logger.info("Starting knowledge base population...")
         
-        # Scrape and ingest vulnerabilities
-        vulnerabilities = self.scrape_nvd_cves(vuln_limit)
+        # Scrape and ingest vulnerabilities (using MCP if available)
+        vulnerabilities = self.scrape_real_vulnerabilities_via_mcp(vuln_limit)
         vuln_success = 0
         for vuln in vulnerabilities:
             if self.ingest_vulnerability(vuln):
