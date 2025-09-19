@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 from git import Repo, GitCommandError, InvalidGitRepositoryError
 import re
 from llama_index.llms.openai import OpenAI
+from pathlib import Path
 
 from .scout_agent import ScoutAgent
 from .shared_types import Finding
@@ -77,16 +78,81 @@ class TriageAgent:
             return False
             
     def _generate_patch(self, finding: Finding) -> Optional[str]:
-        # Simplified rule-based patch for demo
-        if finding.type == "HARDCODED_SECRETS":
-            variable_name = "SECRET_KEY"
-            match = re.search(r"(\w+)\s*=", finding.evidence)
-            if match:
-                # Strip language keywords to get a clean variable name
-                raw_name = match.group(1)
-                variable_name = re.sub(r'^(const|let|var)\s+', '', raw_name).strip().upper()
-            return f"process.env.{variable_name}"
-        return None # Fallback for other types
+        """
+        Generates a patch for a given finding.
+        Uses a rule-based approach for simple, high-confidence fixes.
+        Uses an AI-powered approach for more complex vulnerabilities.
+        """
+        # --- Rule-Based Remediation for High-Confidence Fixes ---
+        if finding.type == 'HARDCODED_SECRETS':
+            logger.info(f"Using rule-based remediation for {finding.type}")
+            # Simple rule: replace hardcoded secret with an environment variable placeholder
+            language = Path(finding.file_path).suffix.lower()
+            if language in ['.py', '.js', '.jsx', '.ts', '.tsx']:
+                # Extract a variable name from the evidence to create a sensible placeholder
+                match = re.search(r"(\w+)\s*[:=]", finding.evidence)
+                variable_name = "YOUR_SECRET_VARIABLE" # Default
+                if match:
+                    raw_name = match.group(1)
+                    variable_name = re.sub(r'^(const|let|var)\s+', '', raw_name).strip().upper()
+                
+                # Return the placeholder format based on language
+                if language == '.py':
+                    return f"os.getenv('{variable_name}')"
+                else: # JavaScript/TypeScript
+                    return f"process.env.{variable_name}"
+            return None # Fallback for other languages
+
+        # --- AI-Powered Remediation for Other Vulnerabilities ---
+        else:
+            logger.info(f"Using AI-powered remediation for {finding.type}")
+            try:
+                # 1. Read the full source code of the vulnerable file
+                full_file_path = os.path.join(self.target_directory, finding.file_path)
+                with open(full_file_path, 'r', encoding='utf-8') as f:
+                    source_code = f.read()
+
+                # 2. Construct a detailed prompt for the LLM
+                prompt = f"""
+                You are an expert security engineer. A security vulnerability has been detected.
+                Your task is to provide the precise code change needed to fix it.
+                
+                VULNERABILITY DETAILS:
+                - Type: {finding.type}
+                - File: {finding.file_path}
+                - Line: {finding.line_number}
+                - Description: {finding.message}
+                - Vulnerable Code Snippet:
+                ```
+                {finding.evidence}
+                ```
+
+                FULL SOURCE CODE of `{finding.file_path}`:
+                ```
+                {source_code}
+                ```
+
+                INSTRUCTIONS:
+                Based on the vulnerability details and the full source code, provide the corrected line of code ONLY.
+                Do not provide explanations, apologies, or any text other than the code fix itself.
+                For example, if the vulnerable line is `password = "12345"`, you should only return `password = os.getenv("DB_PASSWORD")`.
+                """
+
+                # 3. Query the LLM for a patch
+                response = self.llm.complete(prompt)
+                patch_content = response.text.strip()
+                
+                # Basic validation: ensure the patch is not empty and is code-like
+                if patch_content and ('=' in patch_content or '(' in patch_content or '=>' in patch_content):
+                    logger.info(f"AI generated patch for {finding.type}: {patch_content}")
+                    return patch_content
+                else:
+                    logger.warning(f"AI returned an invalid or empty patch: '{patch_content}'")
+                    return None
+
+            except Exception as e:
+                logger.error(f"Error during AI-powered patch generation: {e}")
+                return None
 
     def _apply_patch(self, finding: Finding, patch_content: str) -> bool:
         full_path = os.path.join(self.target_directory, finding.file_path)
