@@ -160,7 +160,8 @@ class ScoutAgent:
             overwrite=False
         )
         
-x            schema=patches_schema,
+        self.patches_store = RedisVectorStore(
+            schema=patches_schema,
             redis_client=redis_client,
             overwrite=False
         )
