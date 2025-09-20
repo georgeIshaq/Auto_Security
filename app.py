@@ -25,10 +25,17 @@ from typing import Optional, Dict, Any, List
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from github import Github, GithubException
+import subprocess
+import threading
+import uuid
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# In-memory store for scan jobs (for demonstration purposes)
+SCAN_JOBS = {}
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -493,6 +500,108 @@ def get_repository_details(owner: str, repo_name: str):
             "error": "Internal server error",
             "message": str(e)
         }), 500
+
+
+@app.route('/api/scan', methods=['POST'])
+def run_scan():
+    """
+    Triggers the vulnerability remediation pipeline for a given repository.
+    This runs the script as a background process.
+    """
+    data = request.get_json()
+    repo_name = data.get('repo_name')
+    token = data.get('token') # Get the token from the request
+
+    if not repo_name or not token:
+        return jsonify({"error": "repo_name and token are required"}), 400
+
+    scan_id = str(uuid.uuid4())
+    SCAN_JOBS[scan_id] = {"status": "running", "results": None, "error": None}
+
+    def run_script(repo, job_id, github_token):
+        """Function to run in a separate thread."""
+        logger.info(f"Starting vulnerability scan for repository: {repo} (Job ID: {job_id})")
+        
+        # Define a unique output file for this scan job
+        output_file = f"scan_results_{job_id}.json"
+
+        try:
+            # Create a copy of the current environment and add the tokens
+            env = os.environ.copy()
+            env['GITHUB_TOKEN'] = github_token
+            # Pass through the OpenAI API key if it exists
+            if 'OPENAI_API_KEY' in os.environ:
+                env['OPENAI_API_KEY'] = os.environ['OPENAI_API_KEY']
+
+            # Command to run the script within the virtual environment
+            command = [
+                os.path.join(os.getcwd(), "venv/bin/python"),
+                os.path.join(os.getcwd(), "run_remediation_pipeline.py"),
+                repo,
+                "--output-file",
+                os.path.join(os.getcwd(), output_file)
+            ]
+            
+            # Use subprocess.run to wait for the process to complete
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,  # We will check the returncode manually
+                env=env,  # Pass the environment with the token to the subprocess
+                cwd=os.getcwd()  # Ensure we run from the correct working directory
+            )
+            
+            # Log the full output for debugging
+            logger.info(f"Scan process for {job_id} finished with return code: {process.returncode}")
+            logger.info(f"Command executed: {' '.join(command)}")
+            logger.info(f"Working directory: {os.getcwd()}")
+            logger.info(f"Environment variables: GITHUB_TOKEN={'set' if env.get('GITHUB_TOKEN') else 'not set'}, OPENAI_API_KEY={'set' if env.get('OPENAI_API_KEY') else 'not set'}")
+            if process.stdout:
+                logger.info(f"Scan stdout for {job_id}: {process.stdout[:500]}...")  # Log first 500 chars
+            if process.stderr:
+                logger.info(f"Scan stderr for {job_id}: {process.stderr[:1000]}...")  # Log first 1000 chars
+
+            if process.returncode == 0:
+                logger.info(f"Successfully completed scan for {repo}")
+                # Read the results from the output file
+                with open(output_file, 'r', encoding='utf-8') as f:
+                    scan_results = json.load(f)
+                SCAN_JOBS[job_id] = {"status": "completed", "results": scan_results, "error": None}
+            else:
+                error_message = process.stderr or "Scan script failed with a non-zero exit code."
+                logger.error(f"Failed to scan repository {repo}. Error: {error_message}")
+                SCAN_JOBS[job_id] = {"status": "failed", "results": None, "error": error_message}
+
+        except Exception as e:
+            logger.error(f"An exception occurred while scanning {repo}: {e}")
+            SCAN_JOBS[job_id] = {"status": "failed", "results": None, "error": str(e)}
+        finally:
+            # Clean up the results file
+            if os.path.exists(output_file):
+                os.remove(output_file)
+
+
+    # Run the script in a background thread to avoid blocking the API request
+    thread = threading.Thread(target=run_script, args=(repo_name, scan_id, token))
+    thread.start()
+
+    return jsonify({
+        "message": f"Scan initiated for repository {repo_name}.",
+        "scan_id": scan_id
+    }), 202
+
+
+@app.route('/api/scan/results/<scan_id>', methods=['GET'])
+def get_scan_results(scan_id: str):
+    """
+    Endpoint for the frontend to poll for scan results.
+    """
+    job = SCAN_JOBS.get(scan_id)
+    if not job:
+        return jsonify({"error": "Scan ID not found"}), 404
+    
+    return jsonify(job), 200
 
 
 @app.errorhandler(404)

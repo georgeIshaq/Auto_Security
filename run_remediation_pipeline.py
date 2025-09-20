@@ -18,6 +18,8 @@ import logging
 import time
 import subprocess
 import argparse
+import json
+import sys
 from git import Repo
 from collections import defaultdict
 from git.exc import GitCommandError
@@ -31,8 +33,8 @@ from vscanner.report_parser import ReportParser
 from vscanner.vulnerability_scanner import VulnerabilityScanner
 from github_client.github_integration import create_github_integration
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging to output to stderr
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
@@ -42,11 +44,11 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 LOCAL_REPO_PATH = "temp_vulnerable_repo"
 REPORT_FILE = "vulnerability_report.text" # This will be the output path
 
-def main(github_repo_name: str):
+def main(github_repo_name: str, output_file: str) -> dict:
     """Main function to run the remediation pipeline."""
     if not GITHUB_TOKEN:
         logger.error("GITHUB_TOKEN environment variable not set. Aborting.")
-        return
+        return {"error": "GITHUB_TOKEN environment variable not set. Aborting."}
 
     # Initialize GitHub client and ScoutAgent
     try:
@@ -56,7 +58,7 @@ def main(github_repo_name: str):
         logger.info("Scout Agent initialized.")
     except Exception as e:
         logger.error(f"Failed to initialize GitHub client: {e}")
-        return
+        return {"error": f"Failed to initialize GitHub client: {e}"}
 
     # 1. Clone the repository
     logger.info(f"Cloning repository '{github_repo_name}' into '{LOCAL_REPO_PATH}'...")
@@ -64,6 +66,10 @@ def main(github_repo_name: str):
         shutil.rmtree(LOCAL_REPO_PATH)
     repo = Repo.clone_from(f"https://{GITHUB_TOKEN}@github.com/{github_repo_name}.git", LOCAL_REPO_PATH)
     logger.info("Repository cloned successfully.")
+    
+    # Detect the default branch name (main or master)
+    default_branch = repo.active_branch.name
+    logger.info(f"Detected default branch: {default_branch}")
 
     # 2. Initialize the advanced scanner and run a scan
     logger.info(f"Initializing advanced scanner...")
@@ -79,6 +85,11 @@ def main(github_repo_name: str):
     with open(report_output_path, 'w', encoding='utf-8') as f:
         f.write(report_content)
 
+    final_results = {
+        "issues": [],
+        "pull_requests": []
+    }
+
     try:
         # 4. Parse the newly generated vulnerability report
         logger.info(f"Parsing vulnerability report: {report_output_path}")
@@ -86,7 +97,7 @@ def main(github_repo_name: str):
         findings = parser.parse(report_output_path)
         if not findings:
             logger.info("No findings in the report. Exiting.")
-            return
+            return final_results
 
         # 3. Create GitHub issues for each finding
         logger.info("Creating GitHub issues for each finding...")
@@ -105,6 +116,8 @@ def main(github_repo_name: str):
         
         # Filter out findings for which we couldn't create an issue
         findings_with_issues = [f for f in findings if f.issue_number is not None]
+        # Store a serializable version of the issues
+        final_results["issues"] = [f.to_dict() for f in findings_with_issues]
 
         # Group findings by vulnerability type
         grouped_findings = defaultdict(list)
@@ -123,8 +136,38 @@ def main(github_repo_name: str):
             try:
                 # Branching, fixing, pushing, and PR creation logic...
                 logger.info(f"Creating branch '{branch_name}'...")
+                
+                # Clean up any existing local branch
                 if branch_name in repo.heads:
                     repo.delete_head(branch_name, '-D')
+                    logger.info(f"Deleted existing local branch '{branch_name}'")
+                
+                # Try to close any existing PR for this branch and delete the remote branch
+                try:
+                    # First, try to find and close any existing PR for this branch
+                    try:
+                        repo_obj = gh.get_repository(github_repo_name)
+                        pulls = repo_obj.get_pulls(state='open', head=f"tads-demo:{branch_name}")
+                        for pr in pulls:
+                            pr.edit(state='closed')
+                            logger.info(f"Closed existing PR #{pr.number} for branch '{branch_name}'")
+                    except Exception as pr_error:
+                        logger.debug(f"No existing PR to close for branch '{branch_name}': {pr_error}")
+                    
+                    # Then delete the remote branch
+                    subprocess.run(
+                        ["git", "push", "origin", "--delete", branch_name],
+                        cwd=LOCAL_REPO_PATH,
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    logger.info(f"Deleted existing remote branch '{branch_name}'")
+                except subprocess.CalledProcessError:
+                    # Remote branch doesn't exist, which is fine
+                    logger.debug(f"Remote branch '{branch_name}' doesn't exist (this is normal)")
+                
+                # Create and checkout the new branch
                 repo.create_head(branch_name).checkout()
 
                 successful_commits = 0
@@ -160,9 +203,18 @@ def main(github_repo_name: str):
                                 title=f"Fix: Remediate {vuln_type} vulnerabilities",
                                 body=pr_body,
                                 head=branch_name,
-                                base="main"
+                                base=default_branch
                             )
                             logger.info(f"Successfully created Pull Request for topic '{vuln_type}': {pr.html_url}")
+                            # Store a serializable version of the PR
+                            final_results["pull_requests"].append({
+                                "id": pr.id,
+                                "title": pr.title,
+                                "number": pr.number,
+                                "status": pr.state,
+                                "url": pr.html_url,
+                                "created_at": pr.created_at.isoformat()
+                            })
                             break # Success, exit retry loop
                         
                         except subprocess.CalledProcessError as e:
@@ -188,8 +240,8 @@ def main(github_repo_name: str):
             except Exception as e:
                 logger.error(f"Failed to process topic '{vuln_type}': {e}")
             finally:
-                # Return to main branch to prepare for the next topic
-                repo.git.checkout('main')
+                # Return to default branch to prepare for the next topic
+                repo.git.checkout(default_branch)
     
     finally:
         # 6. Clean up the local repository and report file
@@ -200,6 +252,16 @@ def main(github_repo_name: str):
             os.remove(report_output_path)
             logger.info(f"Cleaned up report file: {report_output_path}")
 
+    # Write the final results to the specified output file
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(final_results, f, indent=2)
+        logger.info(f"Results saved to {output_file}")
+    except IOError as e:
+        logger.error(f"Failed to write results to {output_file}: {e}")
+
+    return final_results
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Automated vulnerability remediation pipeline.")
     parser.add_argument(
@@ -208,6 +270,12 @@ if __name__ == "__main__":
         default="tads-demo/repo_demo",
         help="The GitHub repository to scan and fix (e.g., 'owner/repo'). Defaults to 'tads-demo/repo_demo'."
     )
+    # Add an argument for the output file
+    parser.add_argument(
+        "--output-file",
+        default="scan_results.json",
+        help="The file to save the JSON results to."
+    )
     args = parser.parse_args()
     
-    main(args.repo)
+    main(args.repo, args.output_file)

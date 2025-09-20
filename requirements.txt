@@ -1,19 +1,19 @@
-PyGithub>=1.59.0
+PyGithub==2.3.0
 
 # Core dependencies for vulnerability scanning
 llama-index==0.14.2
 llama-index-vector-stores-redis==0.6.1
 llama-index-llms-openai==0.5.6
 llama-index-embeddings-openai==0.5.1
-redis>=5.0.0
+redis==5.0.4
 redisvl>=0.4.1
 
 # Web scraping and data processing
-requests==2.32.5
+requests==2.32.3
 beautifulsoup4>=4.12.3
 
 # Environment and configuration
-python-dotenv==1.1.1
+python-dotenv==1.0.1
 
 # Optional: For enhanced functionality
 pydantic==2.11.9
@@ -23,9 +23,11 @@ pygithub==2.8.1
 
 # Flask backend dependencies
 flask==3.1.0
-flask-cors==5.0.0
+flask-cors==4.0.1
 
 # Development dependencies
 pytest==8.4.2
 black==25.9.0
 flake8==7.3.0
+urllib3==2.2.1
+werkzeug==3.0.3

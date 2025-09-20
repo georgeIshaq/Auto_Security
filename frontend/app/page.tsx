@@ -59,7 +59,7 @@ interface PullRequest {
 }
 
 // API configuration
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5173'
+const API_BASE_URL = '/api' // Use relative path for proxy
 
 const mockIssues: SecurityIssue[] = [
   {
@@ -156,7 +156,7 @@ export default function SecurityAutomationTool() {
         params.append('username', username)
       }
 
-      const response = await fetch(`${API_BASE_URL}/api/repositories?${params}`)
+      const response = await fetch(`${API_BASE_URL}/repositories?${params}`)
       
       if (!response.ok) {
         const errorData = await response.json()
@@ -179,35 +179,92 @@ export default function SecurityAutomationTool() {
   }
 
   const handleStartScan = async () => {
-    if (!selectedRepo) return
-
-    setIsScanning(true)
-    setScanProgress(0)
-    setResults(null)
-
-    // Simulate scanning process
-    const steps = [
-      "Connecting to repository...",
-      "Running Scout Agent - Web reconnaissance...",
-      "Running Pentest Agent - Vulnerability scanning...",
-      "Running Triage Agent - Analyzing findings...",
-      "Creating GitHub issues...",
-      "Generating security fixes...",
-      "Creating pull requests...",
-      "Scan complete!",
-    ]
-
-    for (let i = 0; i < steps.length; i++) {
-      setCurrentStep(steps[i])
-      setScanProgress(((i + 1) / steps.length) * 100)
-      await new Promise((resolve) => setTimeout(resolve, 1500))
+    if (!selectedRepo) {
+      setError("Please select a repository to scan.")
+      return
     }
+    
+    setIsScanning(true)
+    setError(null)
+    setResults(null)
+    setCurrentStep("Initiating scan...")
+    setScanProgress(10)
 
-    setResults({
-      issues: mockIssues,
-      prs: mockPRs,
-    })
-    setIsScanning(false)
+    try {
+      const response = await fetch(`${API_BASE_URL}/scan`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          repo_name: selectedRepo,
+          token: githubToken // Send the token to the backend
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+      }
+
+      const result = await response.json();
+      const scanId = result.scan_id;
+      setCurrentStep(result.message + " This may take a few minutes...");
+
+      // Start polling for results
+      const pollInterval = setInterval(async () => {
+        try {
+          const pollResponse = await fetch(`${API_BASE_URL}/scan/results/${scanId}`);
+          if (pollResponse.ok) {
+            const pollResult = await pollResponse.json();
+            
+            if (pollResult.status === 'completed') {
+              clearInterval(pollInterval);
+              setScanProgress(100);
+              setCurrentStep("Scan complete!");
+              // We need to map the backend results to the frontend's data structure
+              const mappedIssues = pollResult.results.issues.map((issue: any) => ({
+                id: issue.id,
+                title: issue.message,
+                severity: issue.severity.toLowerCase(),
+                type: issue.type,
+                description: issue.evidence,
+                file: issue.file_path,
+                line: issue.line_number,
+                status: "open", // Default status
+                created_at: new Date().toISOString(),
+              }));
+              const mappedPRs = pollResult.results.pull_requests.map((pr: any) => ({
+                id: pr.id.toString(),
+                title: pr.title,
+                number: pr.number,
+                status: pr.status,
+                url: pr.url,
+                fixes_issue: 'N/A', // This info isn't in the PR data directly
+                created_at: pr.created_at,
+              }));
+              setResults({ issues: mappedIssues, prs: mappedPRs });
+              setIsScanning(false);
+            } else if (pollResult.status === 'failed') {
+              clearInterval(pollInterval);
+              setError(`Scan failed: ${pollResult.error}`);
+              setIsScanning(false);
+            } else {
+              // Still running, update progress (can be made more granular)
+              setScanProgress(prev => Math.min(prev + 5, 90));
+            }
+          }
+        } catch (pollErr) {
+          clearInterval(pollInterval);
+          setError("Failed to poll for scan results.");
+          setIsScanning(false);
+        }
+      }, 3000); // Poll every 3 seconds
+
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start scan')
+      setIsScanning(false)
+    }
   }
 
   const getSeverityColor = (severity: string) => {

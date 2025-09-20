@@ -1,0 +1,38 @@
+{
+  "issues": [
+    {
+      "id": "GamePage_insecure_random_24_2408221123614101831",
+      "type": "INSECURE_RANDOM",
+      "file_path": "./frontend/src/pages/GamePage.js",
+      "line_number": 24,
+      "severity": "MEDIUM",
+      "message": "Insecure random number generation detected - insufficient entropy for security purposes",
+      "evidence": "Math.random(",
+      "issue_number": 5,
+      "vector_matches": null,
+      "suggested_patches": null
+    },
+    {
+      "id": "GamePage_insecure_random_28_2408221123614101831",
+      "type": "INSECURE_RANDOM",
+      "file_path": "./frontend/src/pages/GamePage.js",
+      "line_number": 28,
+      "severity": "MEDIUM",
+      "message": "Insecure random number generation detected - insufficient entropy for security purposes",
+      "evidence": "Math.random(",
+      "issue_number": 6,
+      "vector_matches": null,
+      "suggested_patches": null
+    }
+  ],
+  "pull_requests": [
+    {
+      "id": 2845502758,
+      "title": "Fix: Remediate INSECURE_RANDOM vulnerabilities",
+      "number": 7,
+      "status": "open",
+      "url": "https://github.com/Ajodo-Godson/Human-Benchy/pull/7",
+      "created_at": "2025-09-19T23:52:52+00:00"
+    }
+  ]
+}
